@@ -1,0 +1,6 @@
+*.o
+
+ofi-msg-fd-sockets-test
+ofi-rdm-test
+ofi-rdm-test-disconnect
+ofi-test
