@@ -162,7 +162,7 @@ static void add_epoll_fd(int fd)
 {
     // This is a memory leak; I know.  Good enough for a small test.
     struct epoll_event *edt;
-    edt = calloc(1, sizeof(edt));
+    edt = calloc(1, sizeof(*edt));
     assert(edt != NULL);
 
     edt->events = EPOLLIN;
