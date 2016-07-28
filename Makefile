@@ -4,7 +4,7 @@ CXX = mpiCC
 LIBFABRIC_DIR = $(bogus)
 
 CPPFLAGS = -I$(LIBFABRIC_DIR)/include
-CFLAGS = -g -O0
+CFLAGS = -g -O0 -Wall
 CXXPPFLAGS = $(CPPFLAGS)
 CXXFLAGS = $(CFLAGS) -std=gnu++11
 

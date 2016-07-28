@@ -32,10 +32,10 @@ using namespace std;
 // Global data structures
 //
 
-static int comm_rank = 0;
-static int comm_size = 0;
+static int comm_rank = -1;
+static int comm_size = -1;
 static int num_servers = 0;
-static int my_epoll_type = 0;
+static uint32_t my_epoll_type = 0;
 static const char *id = "UNKNOWN";
 static bool hostname_set = false;
 static char hostname[4096];
@@ -45,8 +45,6 @@ static char hostname[4096];
 //
 // Logging functions
 //
-
-#define error(msg) do_error((msg), __LINE__)
 
 static void logme(const char *msg, ...)
 {
@@ -58,15 +56,24 @@ static void logme(const char *msg, ...)
      va_end(ap);
 
      if (hostname_set) {
-         fprintf(stderr, "%s:MCW %d: %s", hostname, comm_rank, expanded);
+         fprintf(stderr, "%s:%d:MCW %d:%s: %s", hostname, getpid(), comm_rank, id, expanded);
      } else {
          fprintf(stderr, "%s", expanded);
      }
 }
 
+#define error(msg) do_error((msg), __LINE__)
+
 static void do_error(const char *msg, int line)
 {
-    fprintf(stderr, "ERROR: %s:MCW %d:line %d: %s\n", id, comm_rank, line, msg);
+     if (hostname_set) {
+         fprintf(stderr, "%s:%d:MCW %d:%s:line %d:ERROR: %s",
+                 hostname, getpid(), comm_rank, id, line, msg);
+     } else {
+         fprintf(stderr, "%d:MCW %d:%s:line %d:ERROR: %s",
+                 getpid(), comm_rank, id, line, msg);
+     }
+
     MPI_Abort(MPI_COMM_WORLD, 17);
     exit(1);
 }
@@ -83,7 +90,7 @@ const char *sprintf_cqe_flags(uint64_t flags)
 {
     static char str[8192];
 
-    snprintf(str, sizeof(str), "0x%x: ", flags);
+    snprintf(str, sizeof(str), "0x%" PRIx64 ": ", flags);
     if (flags & FI_SEND) strncat(str, "FI_SEND ", sizeof(str));
     if (flags & FI_RECV) strncat(str, "FI_RECV ", sizeof(str));
     if (flags & FI_RMA) strncat(str, "FI_RMA ", sizeof(str));
@@ -107,7 +114,7 @@ const char *sprintf_cqe_flags(uint64_t flags)
 
 struct ip_addr_t {
     uint32_t ip_addr;
-    uint32_t ip_port;
+    uint32_t ip_port_be;
 };
 
 // modex = data we exchange (out of band / via MPI) for OFI setup/bootstrapping
@@ -148,7 +155,8 @@ static void modex(struct sockaddr_in &sin)
 {
     modex_data_t send_data;
     send_data.ip_addr.ip_addr = sin.sin_addr.s_addr;
-    send_data.ip_addr.ip_port = sin.sin_port;
+    send_data.ip_addr.ip_port_be = sin.sin_port;
+    logme("Modex sending: %s:%d\n", inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
 
     modex_data = new modex_data_t[comm_size];
     assert(modex_data);
@@ -179,8 +187,9 @@ enum cqe_context_type_t {
 struct cqe_context_t {
     cqe_context_type_t type;
 
-    uint64_t seq;
-    uint8_t *buffer;
+    uint64_t           seq;
+    uint8_t           *buffer;
+    struct fid_mr     *mr;
 };
 
 // "Device"-level OFI attributes
@@ -195,7 +204,7 @@ struct device_t {
 
 // JMS: I don't know why, but this causes a segv if
 // rank_to_fi_addr_map is inside struct device_t. :-(
-rank_to_fi_addr_map_t     rank_to_fi_addr_map;
+static rank_to_fi_addr_map_t rank_to_fi_addr_map;
 
 // OFI attributes for a specific RDM endpoint
 struct endpoint_t {
@@ -231,8 +240,10 @@ enum msg_type_t {
 // Messages that OFI clients and servers exchange
 struct msg_t {
     enum msg_type_t type;
+    uint64_t seq;
 
     // Sanity: know who we're sending from and to
+    int from_mcw_rank;
     ip_addr_t from_ip;
     ip_addr_t to_ip;
 
@@ -268,10 +279,44 @@ static int mr_flags = FI_SEND | FI_RECV | FI_READ | FI_WRITE |
     FI_REMOTE_READ | FI_REMOTE_WRITE;
 
 static uint64_t cqe_seq = 0;
+static uint64_t msg_seq = 0;
 
 static const size_t DEFAULT_RECEIVE_SIZE = 12000; // JMS semi-arbitrary large-ish number
 
 static const size_t RDMA_SLAB_SIZE = 1024 * 1024 * 12;
+
+// These two functions need to be defined this far down because it
+// uses data structures and global variables defined just above.
+static void log_inbound_msg(msg_t *msg, const char *label)
+{
+    struct sockaddr_in addr_sin;
+    memset(&addr_sin, 0, sizeof(addr_sin));
+    addr_sin.sin_family = AF_INET;
+    addr_sin.sin_addr.s_addr = msg->from_ip.ip_addr;
+    addr_sin.sin_port = msg->from_ip.ip_port_be;
+
+    logme("Got %s from %s:%d (MCW rank %d), seq=%" PRIu64 "\n",
+          label,
+          inet_ntoa(addr_sin.sin_addr),
+          ntohs(addr_sin.sin_port),
+          msg->from_mcw_rank,
+          msg->seq);
+}
+
+static void log_outbound_msg(int mcw_rank, const char *label)
+{
+    struct sockaddr_in addr_sin;
+    memset(&addr_sin, 0, sizeof(addr_sin));
+    addr_sin.sin_family = AF_INET;
+    addr_sin.sin_addr.s_addr = modex_data[mcw_rank].ip_addr.ip_addr;
+    addr_sin.sin_port = modex_data[mcw_rank].ip_addr.ip_port_be;
+
+    logme("Sending %s to %s:%d (MCW rank %d)\n",
+          label,
+          inet_ntoa(addr_sin.sin_addr),
+          ntohs(addr_sin.sin_port),
+          mcw_rank);
+}
 
 ////////////////////////////////////////////////////////////////////////
 //
@@ -319,9 +364,9 @@ static void wait_for_epoll(void)
     int timeout = 5000;
 
     while (1) {
-        logme("%s blocking on epoll fd: %d\n", id, epoll_fd);
+        //logme("blocking on epoll fd: %d\n", epoll_fd);
         nevents = epoll_wait(epoll_fd, events, NEVENTS, timeout);
-        logme("%s back from epoll\n", id);
+        //logme("back from epoll\n");
         if (nevents < 0) {
             if (errno != EINTR) {
                 error("epoll wait failed");
@@ -329,8 +374,7 @@ static void wait_for_epoll(void)
                 continue;
             }
         } else if (nevents > 0) {
-            logme("%s successfully woke up from epoll! %d events\n",
-                  id, nevents);
+            //logme("successfully woke up from epoll! %d events\n", nevents);
 
             // Epoll context sanity check
             for (int i = 0; i < nevents; ++i) {
@@ -342,7 +386,7 @@ static void wait_for_epoll(void)
             // Happiness!
             return;
         } else {
-            logme("%s wokeup from epoll due to timeout\n", id);
+            logme("wokeup from epoll due to timeout\n");
         }
     }
 }
@@ -367,20 +411,24 @@ static void buffer_pattern_check(uint8_t *ptr, uint64_t len)
     for (uint64_t i = 0; i < len; ++i, ++ptr) {
         if (*ptr != i % 255) {
             if (!printed) {
-                logme("Unexpected buffer[%" PRIu64 "]=%" PRIu64 ", expected %" PRIu64 "\n",
-                      i, *ptr, (i % 255));
+                logme("Unexpected buffer[%" PRIu64 "]=%" PRIu64 ", expected %" PRIu64 " (buffer address %p)\n",
+                      i, *ptr, (i % 255), ptr);
                 printed = true;
                 ++count;
             }
         }
     }
 
-    if (count > 1) {
-        logme("Ran into %" PRIu64 " more errors (out of %" PRIu64 "\n");
+    if (count > 0) {
+        logme("Ran into %" PRIu64 " more errors (out of %" PRIu64 ")\n",
+              count - 1, len);
     }
+#if 0
+    // JMS :-(
     if (count > 0) {
         error("Cannot continue\n");
     }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -477,12 +525,12 @@ static void setup_ofi_device(void)
     if (epoll_fd < 0) {
         error("epoll_create failed");
     }
-    logme("%s made epoll fd: %d\n", id, epoll_fd);
+    logme("made epoll fd: %d\n", epoll_fd);
 
     add_epoll_fd(fidev.eq_fd);
 }
 
-static void setup_ofi_endpoint(endpoint_t &ep, bool setup_rdma_slab)
+static void setup_ofi_endpoint(endpoint_t &ep)
 {
     memset(&ep, 0, sizeof(ep));
 
@@ -545,28 +593,36 @@ static void setup_ofi_endpoint(endpoint_t &ep, bool setup_rdma_slab)
     if (0 != ret) {
         error("fi_getname failed");
     }
-
-    // Setup RDMA (if requested)
-    if (setup_rdma_slab) {
-        ep.rdma_slab = new uint8_t[RDMA_SLAB_SIZE];
-        assert(ep.rdma_slab);
-        memset(ep.rdma_slab, 0, RDMA_SLAB_SIZE);
-        ret = fi_mr_reg(fidev.domain, ep.rdma_slab, RDMA_SLAB_SIZE,
-                        mr_flags, 0, (uintptr_t) ep.rdma_slab,
-                        0, &(ep.rdma_slab_mr), NULL);
-        if (ret != 0) {
-            logme("ERROR: fi_mr_reg ret=%d, %s\n", fi_strerror(-ret));
-            error("fi_mr_reg(rdma) failed");
-        }
-    }
 }
 
-static void teardown_ofi_endpoint(endpoint_t &ep)
+static void setup_ofi_rdma_slab(endpoint_t &ep)
+{
+    ep.rdma_slab = new uint8_t[RDMA_SLAB_SIZE];
+    assert(ep.rdma_slab);
+    memset(ep.rdma_slab, 0, RDMA_SLAB_SIZE);
+
+    int ret;
+    ret = fi_mr_reg(fidev.domain, ep.rdma_slab, RDMA_SLAB_SIZE,
+                    mr_flags, 0, (uintptr_t) ep.rdma_slab,
+                    0, &(ep.rdma_slab_mr), NULL);
+    if (ret != 0) {
+        logme("ERROR: fi_mr_reg ret=%d, %s\n", fi_strerror(-ret));
+        error("fi_mr_reg(rdma) failed");
+    }
+
+    logme("My RDMA slab: %p - %p\n", ep.rdma_slab, (ep.rdma_slab + RDMA_SLAB_SIZE));
+}
+
+static void teardown_ofi_rdma_slab(endpoint_t &ep)
 {
     if (ep.rdma_slab) {
         fi_close(&(ep.rdma_slab_mr->fid));
         delete[] ep.rdma_slab;
     }
+}
+
+static void teardown_ofi_endpoint(endpoint_t &ep)
+{
     fi_close(&(ep.ep->fid));
 
     if (ep.receive_buffers) {
@@ -588,8 +644,7 @@ static void teardown_ofi_device(void)
     fi_freeinfo(fidev.info);
 }
 
-static void wait_for_cq(const char *id, struct fid_cq *cq,
-                        struct fi_cq_msg_entry cqe_out)
+static void wait_for_cq(struct fid_cq *cq, struct fi_cq_msg_entry &cqe_out)
 {
     int ret;
     struct fi_cq_msg_entry cqe;
@@ -599,38 +654,43 @@ static void wait_for_cq(const char *id, struct fid_cq *cq,
 
         ret = fi_cq_read(cq, &cqe, 1);
         if (-FI_EAGAIN == ret) {
-            logme("%s woke up on cq fd, but nothing to read...\n", id);
+            logme("woke up on cq fd, but nothing to read...\n");
             continue;
         } else if (-FI_EAVAIL == ret) {
-            logme("%s ===== woke up on cq fd, but there's something on the error queue!\n", id);
             struct fi_cq_err_entry cee;
             ret = fi_cq_readerr(cq, &cee, 0);
             if (-FI_EAGAIN == ret) {
-                logme("%s ===== there's nothing on the error queue!\n", id);
+                logme("===== there's nothing on the error queue!\n");
                 continue;
             } else if (-FI_EAVAIL == ret) {
-                logme("%s ===== got EAVAIL from cq_readerr\n", id);
+                logme("===== got EAVAIL from cq_readerr\n");
                 continue;
             } else {
-                logme("%s ===== got error from cq: %d, %s\n",
-                      cee.err, fi_strerror(cee.err), id);
+                logme("===== got error from cq: %d, %s\n",
+                      cee.err, fi_strerror(cee.err));
+                cqe_context_t *cqec = (cqe_context_t*) cee.op_context;
+                assert(cqec);
+                assert(CQEC_WRITE == cqec->type);
+                logme("===== error on RDMA WRITE, seq=%" PRIu64 "\n", cqec->seq);
                 continue;
             }
         } else if (ret != 1) {
             error("===== got wrong number of events from fi_cq_read\n");
         }
 
-        logme("%s got completion: flags %s\n",
-              sprintf_cqe_flags(cqe.flags), id);
+#if 0
+        // JMS debugging
+        logme("got completion: flags %s\n", sprintf_cqe_flags(cqe.flags));
         if ((cqe.flags & FI_SEND) && (cqe.flags & FI_MSG)) {
-            logme("%s completed send\n", id);
+            logme("completed send\n");
         } else if ((cqe.flags & FI_RECV) && (cqe.flags & FI_MSG)) {
-            logme("%s completed recv\n", id);
+            logme("completed recv\n");
         } else if (cqe.flags & FI_WRITE) {
-            logme("%s completed RDMA write\n", id);
+            logme("completed RDMA write\n");
         } else {
-            logme("%s ====== got some unknown completion!\n", id);
+            logme("====== got some unknown completion!\n");
         }
+#endif
 
         cqe_out = cqe;
         return;
@@ -663,13 +723,15 @@ static fi_addr_t rank_to_fi_addr(int rank)
     struct sockaddr_in addr_sin;
     memset(&addr_sin, 0, sizeof(addr_sin));
     addr_sin.sin_family = AF_INET;
-    addr_sin.sin_addr.s_addr = modex_data[comm_rank].ip_addr.ip_addr;
-    addr_sin.sin_port = modex_data[comm_rank].ip_addr.ip_port;
+    addr_sin.sin_addr.s_addr = modex_data[rank].ip_addr.ip_addr;
+    addr_sin.sin_port = modex_data[rank].ip_addr.ip_port_be;
 
     int ret;
     fi_addr_t addr_fi;
     ret = fi_av_insert(fidev.av, &addr_sin, 1, &addr_fi, 0, NULL);
-    assert(ret == 1);
+    assert(1 == ret);
+    logme("fi_av_insert of %s:%d --> fi_addr_t 0x%" PRIx64 "\n",
+          inet_ntoa(addr_sin.sin_addr), htons(addr_sin.sin_port), addr_fi);
 
     rank_to_fi_addr_map[rank] = addr_fi;
 
@@ -706,71 +768,76 @@ static void post_receives(endpoint_t &ep)
     memset(ep.cqe_contexts, 0, ep.receive_buffer_count * sizeof(cqe_context_t));
 
     uint8_t *ptr = (uint8_t*) ep.receive_buffers;
-    for (int i = 1; i < ep.receive_buffer_count; ++i) {
+    for (uint32_t i = 0; i < ep.receive_buffer_count; ++i) {
         ep.cqe_contexts[i].type = CQEC_RECV;
         ep.cqe_contexts[i].seq = 0;
         ep.cqe_contexts[i].buffer = ptr;
+        ep.cqe_contexts[i].mr = NULL;
 
         post_receive(ep, ptr, &(ep.cqe_contexts[i]));
         ptr += ep.receive_buffer_size;
     }
+    logme("Posted %d receives\n", ep.receive_buffer_count);
 }
 
-static void msg_fill_header(msg_t &msg, msg_type_t type, int target_mcw_rank)
+static void msg_fill_header(endpoint_t &ep, msg_t *msg, msg_type_t type)
 {
-    msg.type = type;
-    msg.from_ip = modex_data[comm_rank].ip_addr;
-    msg.to_ip = modex_data[target_mcw_rank].ip_addr;
+    msg->type = type;
+    msg->seq = msg_seq++;
+    msg->from_mcw_rank = comm_rank;
+    msg->from_ip.ip_addr = (uint32_t) ep.my_sin.sin_addr.s_addr;
+    msg->from_ip.ip_port_be = (uint32_t) ep.my_sin.sin_port;
+
+    logme("Fill header: from mcw=%d, from ip=%s:%d\n",
+          msg->from_mcw_rank,
+          inet_ntoa(ep.my_sin.sin_addr),
+          ntohs(msg->from_ip.ip_port_be));
 }
 
-static void msg_send_and_wait(endpoint_t &ep, msg_t &msg,
-                              int target_mcw_rank)
+static uint64_t msg_send(endpoint_t &ep, msg_t *msg, fi_addr_t peer_fi)
 {
     // Make a CQ context entry
-    cqe_context_t cqec;
-    cqec.type = CQEC_SEND;
+    cqe_context_t *cqec = new cqe_context_t;
+    assert(cqec);
+    cqec->type = CQEC_SEND;
     uint64_t my_seq;
     my_seq = cqe_seq++;
-    cqec.seq = my_seq;
+    cqec->seq = my_seq;
+    cqec->buffer = (uint8_t*) msg;
 
     // Send the message
-    fi_addr_t server_fi;
-    server_fi = rank_to_fi_addr(target_mcw_rank);
-    fi_send(ep.ep, &msg, sizeof(msg),
-            fi_mr_desc(&no_mr), server_fi, &cqec);
+    logme("Sending to fi_addr 0x%" PRIx64 "\n", peer_fi);
+    fi_send(ep.ep, msg, sizeof(*msg), fi_mr_desc(&no_mr), peer_fi, cqec);
+
+    return my_seq;
+}
+
+static void msg_send_and_wait(endpoint_t &ep, msg_t *msg, int peer_mcw_rank)
+{
+    fi_addr_t peer_fi;
+    peer_fi = rank_to_fi_addr(peer_mcw_rank);
+    uint64_t my_seq;
+    my_seq = msg_send(ep, msg, peer_fi);
 
     // Wait for the send completion
     struct fi_cq_msg_entry cqe;
-    wait_for_cq(id, ep.cq, cqe);
+    memset(&cqe, 0, sizeof(cqe));
+    wait_for_cq(ep.cq, cqe);
     assert(cqe.flags & FI_SEND);
     assert(cqe.flags & FI_MSG);
-    assert(cqe.op_context == &cqec);
-    assert(cqec.type == CQEC_SEND);
-    assert(cqec.seq == my_seq);
+
+    cqe_context_t *cqec;
+    cqec = (cqe_context_t*) cqe.op_context;
+    assert(cqec->type == CQEC_SEND);
+    assert(cqec->seq == my_seq);
+
+    logme("Send to MCW rank %d completed\n", peer_mcw_rank);
 }
 
-static void msg_wait_for_recv(endpoint_t &ep, msg_type_t type,
-                              cqe_context_t *&cqec)
+static void msg_verify(endpoint_t &ep, msg_t *msg)
 {
-    // Wait for something on the CQ
-    struct fi_cq_msg_entry cqe;
-    wait_for_cq(id, ep.cq, cqe);
-
-    // Make sure it was a receive
-    assert(cqe.flags & FI_RECV);
-    assert(cqe.flags & FI_MSG);
-
-    assert(cqe.op_context);
-    cqec = (cqe_context_t*) cqe.op_context;
-    assert(cqec->type == CQEC_RECV);
-    assert(cqec->seq == 0);
-
-    // Make sure the message was actually for me
-    // (**** THIS IS THE MAIN PART OF THE TEST ***)
-    msg_t *msg;
-    msg = (msg_t*) cqec->buffer;
     if (msg->to_ip.ip_addr != ep.my_sin.sin_addr.s_addr ||
-        msg->to_ip.ip_port != ep.my_sin.sin_port) {
+        msg->to_ip.ip_port_be != ep.my_sin.sin_port) {
         const char *my_ip = strdup(inet_ntoa(ep.my_sin.sin_addr));
         struct sockaddr_in sin;
         sin.sin_family = AF_INET;
@@ -778,20 +845,299 @@ static void msg_wait_for_recv(endpoint_t &ep, msg_type_t type,
         const char *from_ip = strdup(inet_ntoa(sin.sin_addr));
         sin.sin_addr.s_addr = msg->to_ip.ip_addr;
         const char *to_ip = strdup(inet_ntoa(sin.sin_addr));
-        logme("ERROR!  %s:%d got a message from %s:%d that was really bound for %s:%d!!",
+
+        logme("ERROR: %s:%d got a message of type %d from %s:%d that was really bound for %s:%d!!\n",
               my_ip, ntohs(ep.my_sin.sin_port),
-              from_ip, ntohs(msg->from_ip.ip_port),
-              to_ip, ntohs(msg->to_ip.ip_port));
-        error("TEST FAIL!");
+              msg->type,
+              from_ip, ntohs(msg->from_ip.ip_port_be),
+              to_ip, ntohs(msg->to_ip.ip_port_be));
+        error("*********** TEST FAIL!\n");
     }
-
-    // Make sure the received message was the right type
-    assert(msg->type == type);
-
-    // All good!
 }
 
 ////////////////////////////////////////////////////////////////////////
+
+struct client_info_t {
+    struct sockaddr_in   addr_sin; // just for our reference
+    int                  mcw_rank; // just for our reference
+
+    ip_addr_t            addr_ip;  // used to address msg_t's to client
+    fi_addr_t            addr_fi;  // used to fi_send/fi_write to client
+    uint64_t             rdma_key; // used to fi_write to client
+};
+
+typedef map<struct sockaddr_in, client_info_t> client_map_t;
+
+static client_map_t client_map;
+
+// Provide operator<() for sockaddr_in so that we can use it as the
+// key in an stl::map.
+static bool operator<(const sockaddr_in a, const sockaddr_in b)
+{
+    if (a.sin_family < b.sin_family) {
+        return true;
+    } else if (a.sin_family > b.sin_family) {
+        return false;
+    } else if (a.sin_addr.s_addr < b.sin_addr.s_addr) {
+        return true;
+    } else if (a.sin_addr.s_addr > b.sin_addr.s_addr) {
+        return false;
+    } else if (a.sin_port > b.sin_port) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static void server_handle_rdma_completion(struct fi_cq_msg_entry &cqe)
+{
+    // We completed an RDMA write.  Yay!
+    logme("Completed an RDMA write\n");
+
+    // Get the CQEC
+    assert(cqe.op_context);
+    cqe_context_t *cqec;
+    cqec = (cqe_context_t*) cqe.op_context;
+
+    // Verify that this cqec is valid
+    assert(cqec);
+    assert(CQEC_WRITE == cqec->type);
+    assert(cqec->buffer);
+    assert(cqec->mr);
+
+    // De-register the RDMA memory
+    fi_close(&(cqec->mr->fid));
+
+    // Delete the RDMA buffer and the CQEC
+    delete[] cqec->buffer;
+    delete cqec;
+}
+
+static void server_handle_send_completion(struct fi_cq_msg_entry &cqe)
+{
+    // We completed a send.  Yay!
+    logme("Completed a send\n");
+
+    // Get the CQEC
+    assert(cqe.op_context);
+    cqe_context_t *cqec;
+    cqec = (cqe_context_t*) cqe.op_context;
+
+    // Verify that this cqec is valid
+    assert(cqec);
+    assert(CQEC_SEND == cqec->type);
+    assert(cqec->buffer);
+
+    // Delete the send buffer and the CQEC
+    delete cqec->buffer;
+    delete cqec;
+}
+
+static void server_handle_connect(struct endpoint_t &ep, msg_t *msg)
+{
+    log_inbound_msg(msg, "MSG_CONNECT");
+
+    // Make sure we don't already know this client
+    struct sockaddr_in addr_sin;
+    memset(&addr_sin, 0, sizeof(addr_sin));
+    addr_sin.sin_family = AF_INET;
+    addr_sin.sin_addr.s_addr = msg->from_ip.ip_addr;
+    addr_sin.sin_port = msg->from_ip.ip_port_be;
+
+    client_map_t::iterator it;
+    it = client_map.find(addr_sin);
+    if (client_map.end() != it) {
+        error("...but we're already connected\n");
+    }
+
+    // Resolve the client address (so we can send to it)
+    int ret;
+    fi_addr_t addr_fi;
+    ret = fi_av_insert(fidev.av, &addr_sin, 1, &addr_fi, 0, NULL);
+    assert(1 == ret);
+    logme("fi_av_insert of %s:%d --> fi_addr_t 0x%" PRIx64 "\n",
+          inet_ntoa(addr_sin.sin_addr), htons(addr_sin.sin_port), addr_fi);
+
+    // Save the client info in the client map
+    struct client_info_t cinfo;
+    cinfo.addr_sin = addr_sin;
+    cinfo.addr_fi = addr_fi;
+    cinfo.addr_ip = msg->from_ip;
+    cinfo.rdma_key = msg->u.connect.client_rdma_key;
+    cinfo.mcw_rank = msg->from_mcw_rank;
+    client_map[addr_sin] = cinfo;
+
+    // Send back a CONNECT_ACK
+    // Fill header of message
+    msg_t *to_client = new msg_t;
+    assert(to_client);
+    msg_fill_header(ep, to_client, MSG_CONNECT_ACK);
+    to_client->to_ip = cinfo.addr_ip;
+
+    // Fill payload of message
+    // JMS For the moment, not initiating RDMA client --> server.
+    // Just send back a bogus key.
+    to_client->u.connect_ack.server_rdma_key = 0;
+
+    // Send the CONNECT_ACK (no need to wait for it here)
+    logme("Sending CONNECT_ACK back to %s:%d, fi_addr 0x%" PRIx64 "\n",
+          inet_ntoa(cinfo.addr_sin.sin_addr),
+          ntohs(cinfo.addr_sin.sin_port),
+          cinfo.addr_fi);
+    msg_send(ep, to_client, addr_fi);
+    logme("Sent CONNECT_ACK back to %s:%d, fi_addr 0x%" PRIx64 "\n",
+          inet_ntoa(cinfo.addr_sin.sin_addr),
+          ntohs(cinfo.addr_sin.sin_port),
+          cinfo.addr_fi);
+}
+
+static void server_handle_disconnect(struct endpoint_t &ep, msg_t *msg)
+{
+    log_inbound_msg(msg, "MSG_DISCONNECT");
+
+    // Make sure we already know this client
+    struct sockaddr_in addr_sin;
+    memset(&addr_sin, 0, sizeof(addr_sin));
+    addr_sin.sin_family = AF_INET;
+    addr_sin.sin_addr.s_addr = msg->from_ip.ip_addr;
+    addr_sin.sin_port = msg->from_ip.ip_port_be;
+
+    client_map_t::iterator it;
+    it = client_map.find(addr_sin);
+    if (client_map.end() == it) {
+        error("...but we don't know who this client is!\n");
+    }
+
+    // Remove this client from the fi_av
+    int ret;
+    ret = fi_av_remove(fidev.av, &(it->second.addr_fi), 1, 0);
+    assert(0 == ret);
+    logme("fi_av_remove of %s:%d --> fi_addr_t 0x%" PRIx64 "\n",
+          inet_ntoa(it->second.addr_sin.sin_addr),
+          htons(it->second.addr_sin.sin_port),
+          it->second.addr_fi);
+
+    // Remove this client from the client_map
+    client_map.erase(it);
+}
+
+static void server_handle_solicit_rdma(struct endpoint_t &ep, msg_t *msg)
+{
+    log_inbound_msg(msg, "SOLICIT_RDMA");
+
+    // Make sure we already know this client
+    struct sockaddr_in addr_sin;
+    memset(&addr_sin, 0, sizeof(addr_sin));
+    addr_sin.sin_family = AF_INET;
+    addr_sin.sin_addr.s_addr = msg->from_ip.ip_addr;
+    addr_sin.sin_port = msg->from_ip.ip_port_be;
+
+    client_map_t::iterator it;
+    it = client_map.find(addr_sin);
+    if (client_map.end() == it) {
+        error("...but we don't know who this client is!\n");
+    }
+
+    // Randomize the amount of data we're going to RDMA back.  Use the
+    // client-requested size as the upper bound.
+    size_t len;
+    len = msg->u.solicit_rdma.client_rdma_target_len;
+    len *= drand48();
+    if (0 == len) {
+        len = msg->u.solicit_rdma.client_rdma_target_len;
+    }
+
+    // Make a buffer to RDMA write, and fill it with a predictable
+    // pattern
+    uint8_t *rdma_buffer = new uint8_t[len];
+    assert(rdma_buffer);
+    buffer_pattern_fill(rdma_buffer, len);
+
+    // Make a context to store info about the RDMA buffer (so we can
+    // free it when the RDMA write is complete)
+    cqe_context_t *cqec = new cqe_context_t;
+    assert(cqec);
+    memset(cqec, 0, sizeof(*cqec));
+    cqec->type = CQEC_WRITE;
+    cqec->seq = cqe_seq++;
+    cqec->buffer = rdma_buffer;
+
+    int ret;
+    ret = fi_mr_reg(fidev.domain, rdma_buffer, len,
+                    mr_flags, 0, (uintptr_t) rdma_buffer,
+                    0, &(cqec->mr), NULL);
+    if (ret != 0) {
+        logme("ERROR: fi_mr_reg ret=%d, %s\n", fi_strerror(-ret));
+        error("fi_mr_reg(rdma) failed");
+    }
+
+    // Do the RDMA write
+    logme("RDMA writing to %s:%d (fi_addr 0x%" PRIx64 ", MCW rank %d), dest buffer=%p - %p, seq=%" PRIu64 ", dest key=%" PRIx64 "\n",
+          inet_ntoa(it->second.addr_sin.sin_addr),
+          ntohs(it->second.addr_sin.sin_port),
+          it->second.addr_fi,
+          it->second.mcw_rank,
+          msg->u.solicit_rdma.client_rdma_target_addr,
+          msg->u.solicit_rdma.client_rdma_target_addr + len,
+          cqec->seq,
+          it->second.rdma_key);
+    ret = fi_write(ep.ep, rdma_buffer, len, fi_mr_desc(cqec->mr),
+                   it->second.addr_fi,
+                   msg->u.solicit_rdma.client_rdma_target_addr,
+                   it->second.rdma_key,
+                   cqec);
+    assert(0 == ret);
+
+    // Send back a RDMA_SENT
+    // Fill header of message
+    msg_t *to_client = new msg_t;
+    assert(to_client);
+    msg_fill_header(ep, to_client, MSG_RDMA_SENT);
+    to_client->to_ip = it->second.addr_ip;
+
+    // Fill payload of message
+    to_client->u.rdma_sent.client_rdma_target_addr =
+        msg->u.solicit_rdma.client_rdma_target_addr;
+    to_client->u.rdma_sent.client_rdma_actual_len = len;
+
+    // Send it (no need to wait for it here)
+    msg_send(ep, to_client, it->second.addr_fi);
+    logme("Sent RDMA_SENT back to %s:%d, fi_addr 0x%" PRIx64 "\n",
+          inet_ntoa(it->second.addr_sin.sin_addr),
+          ntohs(it->second.addr_sin.sin_port),
+          it->second.addr_fi);
+}
+
+static void server_handle_receive(struct endpoint_t &ep, struct fi_cq_msg_entry &cqe)
+{
+    cqe_context_t *cqec;
+    cqec = (cqe_context_t*) cqe.op_context;
+    assert(cqec->type == CQEC_RECV);
+
+    msg_t *msg = (msg_t*) cqec->buffer;
+    msg_verify(ep, msg);
+
+    switch(msg->type) {
+    case MSG_CONNECT:
+        server_handle_connect(ep, msg);
+        break;
+
+    case MSG_DISCONNECT:
+        server_handle_disconnect(ep, msg);
+        break;
+
+    case MSG_SOLICIT_RDMA:
+        server_handle_solicit_rdma(ep, msg);
+        break;
+
+    default:
+        logme("Got unexpected message type: %d\n", msg->type);
+        error("cannot continue");
+    }
+
+    // Repost the receive buffer
+    post_receive(ep, cqec->buffer, (void*) cqec);
+}
 
 //
 // Main Server function
@@ -801,10 +1147,10 @@ static void server_main()
     setup_ofi_device();
 
     endpoint_t ep;
-    setup_ofi_endpoint(ep, false);
+    setup_ofi_endpoint(ep);
 
     // Print server addr
-    logme("SERVER listening on %s:%d\n",
+    logme("listening on %s:%d\n",
           inet_ntoa(ep.my_sin.sin_addr),
           ntohs(ep.my_sin.sin_port));
 
@@ -814,10 +1160,22 @@ static void server_main()
     // Broadcast my OFI endpoint IP address+port to all clients
     modex(ep.my_sin);
 
+    uint64_t rma_completion = FI_RMA | FI_MSG | FI_SEND;
+    uint64_t send_completion = FI_SEND | FI_MSG;
+    uint64_t recv_completion = FI_RECV | FI_MSG;
+
     // Main server loop
+    struct fi_cq_msg_entry cqe;
     while (1) {
-        // JMS fill me in
-        //server_receive_cts();
+        wait_for_cq(ep.cq, cqe);
+        if (rma_completion == (cqe.flags & rma_completion)) {
+            server_handle_rdma_completion(cqe);
+        } else if (send_completion == (cqe.flags & send_completion)) {
+            server_handle_send_completion(cqe);
+        } else if (recv_completion == (cqe.flags & recv_completion)) {
+            // We completed a recive.  Yay!
+            server_handle_receive(ep, cqe);
+        }
     }
 
     teardown_ofi_endpoint(ep);
@@ -826,30 +1184,96 @@ static void server_main()
 
 ////////////////////////////////////////////////////////////////////////
 
+static void client_wait_for_recv(endpoint_t &ep, msg_type_t type,
+                                 cqe_context_t *&cqec)
+{
+    logme("Waiting to receive message of type %d\n", type);
+
+    // Wait for something on the CQ
+    struct fi_cq_msg_entry cqe;
+    while (1) {
+        wait_for_cq(ep.cq, cqe);
+
+        assert(cqe.op_context);
+        cqec = (cqe_context_t*) cqe.op_context;
+
+        // If we completed a send, free the buffer and cqec
+        if (cqe.flags & FI_SEND) {
+            logme("CQ: Completed a send\n");
+            delete cqec->buffer;
+            delete cqec;
+            continue;
+        }
+
+        // If we completed an RDMA (should never happen here in the client)
+        if ((cqe.flags & FI_RECV) && (cqe.flags & FI_RMA)) {
+            logme("CQ: Completed an RDMA\n");
+            continue;
+        }
+
+        // Make sure it was a receive
+        assert(cqe.flags & FI_RECV);
+        assert(cqe.flags & FI_MSG);
+        logme("CQ: Completed a receive\n");
+
+        assert(cqec->type == CQEC_RECV);
+        assert(cqec->seq == 0);
+
+        // Make sure the received message was the right type
+        msg_t *msg;
+        msg = (msg_t*) cqec->buffer;
+        msg_verify(ep, msg);
+        assert(msg->type == type);
+
+        // All good!
+        return;
+    }
+}
+
 static void client_hulk_smash(endpoint_t &ep)
 {
-    logme(id, "Hulk smash!");
+    logme("Hulk smash!\n");
 
     // Tear it all down
+    teardown_ofi_rdma_slab(ep);
     teardown_ofi_endpoint(ep);
     teardown_ofi_device();
 
-    // Recrease
+    // Recreate
     setup_ofi_device();
-    setup_ofi_endpoint(ep, true);
+    setup_ofi_endpoint(ep);
+    setup_ofi_rdma_slab(ep);
 }
 
 static void client_connect(endpoint_t &ep, int server_mcw_rank)
 {
+    log_outbound_msg(server_mcw_rank, "MSG_CONNECT");
+
     // Fill header of message
-    msg_t msg;
-    msg_fill_header(msg, MSG_CONNECT, server_mcw_rank);
+    msg_t *to_server = new msg_t;
+    assert(to_server);
+    msg_fill_header(ep, to_server, MSG_CONNECT);
+    to_server->to_ip = modex_data[server_mcw_rank].ip_addr;
 
     // Fill payload of message
-    msg.u.connect.client_rdma_key = fi_mr_key(ep.rdma_slab_mr);
+    to_server->u.connect.client_rdma_key = fi_mr_key(ep.rdma_slab_mr);
 
-    // Send and wait for the message completion
-    msg_send_and_wait(ep, msg, server_mcw_rank);
+    // Send
+    fi_addr_t peer_fi;
+    peer_fi = rank_to_fi_addr(server_mcw_rank);
+    msg_send(ep, to_server, peer_fi);
+
+    // Wait for CONNECT_ACK message and completion of the send
+    cqe_context_t *cqec;
+    logme("Waiting to receive CONNECT_ACK...\n");
+    client_wait_for_recv(ep, MSG_CONNECT_ACK, cqec);
+    logme("Received CONNECT_ACK -- yay!\n");
+
+    // We don't need any information from the CONNECT_ACK -- just
+    // getting it is good enough.
+
+    // Repost the receive
+    post_receive(ep, cqec->buffer, cqec);
 }
 
 static void client_solicit_rdma(endpoint_t &ep, int server_mcw_rank)
@@ -859,41 +1283,55 @@ static void client_solicit_rdma(endpoint_t &ep, int server_mcw_rank)
         client_connect(ep, server_mcw_rank);
     }
 
+    log_outbound_msg(server_mcw_rank, "MSG_SOLICIT_RDMA");
+
     // Reset the RDMA slab to known values
     memset(ep.rdma_slab, 17, RDMA_SLAB_SIZE);
 
     // Ask for an RDMA to a random chunk in the middle of the slab
-    size_t offset = (size_t) (RDMA_SLAB_SIZE * drand48());
+    size_t offset = (size_t) ((RDMA_SLAB_SIZE / 2) * drand48());
+    // Make sure it is aligned
+    offset -= (offset % 8);
     size_t len = (size_t) ((RDMA_SLAB_SIZE / 2) * drand48());
     uint8_t *ptr = ep.rdma_slab + offset;
-    assert(ptr < ep.rdma_slab + RDMA_SLAB_SIZE);
-    assert(ptr + len < ep.rdma_slab + RDMA_SLAB_SIZE);
+    assert(ptr < (ep.rdma_slab + RDMA_SLAB_SIZE));
+    assert(ptr + len < (ep.rdma_slab + RDMA_SLAB_SIZE));
 
     // Request some RDMA from the server
-    msg_t msg;
-    msg_fill_header(msg, MSG_SOLICIT_RDMA, server_mcw_rank);
+    msg_t *to_server = new msg_t;
+    assert(to_server);
+    msg_fill_header(ep, to_server, MSG_SOLICIT_RDMA);
+    to_server->to_ip = modex_data[server_mcw_rank].ip_addr;
+    logme("SOLICIT_RDMA buffer: %p - %p, len: %" PRIu64 ", key: 0x%" PRIx64 "\n",
+          ptr, (ptr + len), len, fi_mr_key(ep.rdma_slab_mr));
 
     // Fill payload of message
-    msg.u.solicit_rdma.client_rdma_target_addr = (uint64_t)(uintptr_t) ptr;
-    msg.u.solicit_rdma.client_rdma_target_len = (uint64_t) len;
+    to_server->u.solicit_rdma.client_rdma_target_addr = (uint64_t)(uintptr_t) ptr;
+    to_server->u.solicit_rdma.client_rdma_target_len = (uint64_t) len;
 
-    // Send and wait for the message completion
-    msg_send_and_wait(ep, msg, server_mcw_rank);
+    // Send it
+    fi_addr_t peer_fi;
+    peer_fi = rank_to_fi_addr(server_mcw_rank);
+    msg_send(ep, to_server, peer_fi);
 
     // Wait for a message back from the server saying that the RDMA to
     // my slab is done
     cqe_context_t *cqec;
-    msg_wait_for_recv(ep, MSG_RDMA_SENT, cqec);
+    client_wait_for_recv(ep, MSG_RDMA_SENT, cqec);
 
     // Make sure we got a valid reply from the server
-    msg_t *received_msg;
-    received_msg = (msg_t*) cqec->buffer;
-    assert(received_msg->u.rdma_sent.client_rdma_target_addr ==
+    msg_t *from_server;
+    from_server = (msg_t*) cqec->buffer;
+    assert(from_server->u.rdma_sent.client_rdma_target_addr ==
            (uint64_t)(uintptr_t) ptr);
-    assert(received_msg->u.rdma_sent.client_rdma_actual_len <= len);
+    assert(from_server->u.rdma_sent.client_rdma_actual_len <= len);
+
+    logme("Got MSG_RDMA_SENT: server wrote %" PRIu64 " bytes to %p\n",
+          from_server->u.rdma_sent.client_rdma_actual_len,
+          from_server->u.rdma_sent.client_rdma_target_addr);
 
     // Check that we got what we think we should have gotten
-    buffer_pattern_check(ptr, received_msg->u.rdma_sent.client_rdma_actual_len);
+    buffer_pattern_check(ptr, from_server->u.rdma_sent.client_rdma_actual_len);
 
     // Repost the receive
     post_receive(ep, cqec->buffer, cqec);
@@ -906,14 +1344,20 @@ static void client_disconnect(endpoint_t &ep, int server_mcw_rank)
         return;
     }
 
+    log_outbound_msg(server_mcw_rank, "MSG_DISCONNECT");
+
     // Fill header of message
-    msg_t msg;
-    msg_fill_header(msg, MSG_DISCONNECT, server_mcw_rank);
+    msg_t *to_server = new msg_t;
+    assert(to_server);
+    msg_fill_header(ep, to_server, MSG_DISCONNECT);
+    to_server->to_ip = modex_data[server_mcw_rank].ip_addr;
 
     // There is no payload for the DISCONNECT message
 
     // Send and wait for the message
-    msg_send_and_wait(ep, msg, server_mcw_rank);
+    fi_addr_t peer_fi;
+    peer_fi = rank_to_fi_addr(server_mcw_rank);
+    msg_send(ep, to_server, peer_fi);
 }
 
 //
@@ -923,14 +1367,23 @@ static void client_main()
 {
     setup_ofi_device();
 
-    // Get all the servers' OFI endpoints IP addresses+ports
-    // (contribute {0} for me, because I'm a client)
+    // Get all the servers' OFI endpoints IP addresses+ports.
+    // Additionally: in the real application, all server IPs are
+    // distributed OOB ahead of time, but client IPs are discovered by
+    // servers when the clients send to them.
     struct sockaddr_in sin = {0};
     modex(sin);
 
-    // Create my endpoint
+    // Create my endpoint and RDMA slab
     endpoint_t ep;
-    setup_ofi_endpoint(ep, true);
+    setup_ofi_endpoint(ep);
+    setup_ofi_rdma_slab(ep);
+
+    logme("My endpoint is %s:%d\n",
+          inet_ntoa(ep.my_sin.sin_addr), ntohs(ep.my_sin.sin_port));
+
+    // Post receives
+    post_receives(ep);
 
     // Main client loop
     double chaos;
@@ -943,13 +1396,10 @@ static void client_main()
         // Randomly pick an action
         chaos = drand48();
         if (chaos < 0.05) {
-            logme("hulk smash!\n");
             client_hulk_smash(ep);
         } else if (chaos < 0.25) {
-            logme("client disconnect\n");
             client_disconnect(ep, server_mcw_rank);
         } else {
-            logme("solicit RDMA\n");
             client_solicit_rdma(ep, server_mcw_rank);
         }
 
