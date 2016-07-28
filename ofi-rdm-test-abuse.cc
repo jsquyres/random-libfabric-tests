@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <netinet/in.h>
@@ -12,6 +11,7 @@
 #include <assert.h>
 #include <sys/epoll.h>
 
+#include <cstdlib>
 #include <cinttypes>
 #include <map>
 
@@ -78,6 +78,8 @@ static void do_error(const char *msg, int line)
     exit(1);
 }
 
+#if 0
+// JMS uncomment for debug
 static void wait_for_debugger(void)
 {
     printf("%s:%s:MCW %d:PID %d: waiting for debugger attach...\n",
@@ -85,6 +87,7 @@ static void wait_for_debugger(void)
     int i = 0;
     while (i == 0) sleep(5);
 }
+#endif
 
 const char *sprintf_cqe_flags(uint64_t flags)
 {
@@ -135,10 +138,18 @@ static void setup_mpi(void)
     MPI_Get_processor_name(hostname, &s);
     hostname_set = true;
 
+    if (comm_size < 2) {
+        error("Must run at least 2 MPI processes\n");
+    }
+
     // Make client:server ratio be 3:1
-    num_servers = comm_size / 4;
-    if (num_servers < 1) {
-        error("Must run enough MPI processes to have servers");
+    if (comm_size < 4) {
+        num_servers = 1;
+    } else {
+        num_servers = comm_size / 4;
+        if (num_servers < 1) {
+            error("Must run enough MPI processes to have servers\n");
+        }
     }
 
     // Make things (sorta) repeatable
@@ -593,6 +604,9 @@ static void setup_ofi_endpoint(endpoint_t &ep)
     if (0 != ret) {
         error("fi_getname failed");
     }
+
+    logme("My endpoint is %s:%d\n",
+          inet_ntoa(ep.my_sin.sin_addr), ntohs(ep.my_sin.sin_port));
 }
 
 static void setup_ofi_rdma_slab(endpoint_t &ep)
@@ -810,28 +824,6 @@ static uint64_t msg_send(endpoint_t &ep, msg_t *msg, fi_addr_t peer_fi)
     fi_send(ep.ep, msg, sizeof(*msg), fi_mr_desc(&no_mr), peer_fi, cqec);
 
     return my_seq;
-}
-
-static void msg_send_and_wait(endpoint_t &ep, msg_t *msg, int peer_mcw_rank)
-{
-    fi_addr_t peer_fi;
-    peer_fi = rank_to_fi_addr(peer_mcw_rank);
-    uint64_t my_seq;
-    my_seq = msg_send(ep, msg, peer_fi);
-
-    // Wait for the send completion
-    struct fi_cq_msg_entry cqe;
-    memset(&cqe, 0, sizeof(cqe));
-    wait_for_cq(ep.cq, cqe);
-    assert(cqe.flags & FI_SEND);
-    assert(cqe.flags & FI_MSG);
-
-    cqe_context_t *cqec;
-    cqec = (cqe_context_t*) cqe.op_context;
-    assert(cqec->type == CQEC_SEND);
-    assert(cqec->seq == my_seq);
-
-    logme("Send to MCW rank %d completed\n", peer_mcw_rank);
 }
 
 static void msg_verify(endpoint_t &ep, msg_t *msg)
@@ -1145,14 +1137,8 @@ static void server_handle_receive(struct endpoint_t &ep, struct fi_cq_msg_entry 
 static void server_main()
 {
     setup_ofi_device();
-
     endpoint_t ep;
     setup_ofi_endpoint(ep);
-
-    // Print server addr
-    logme("listening on %s:%d\n",
-          inet_ntoa(ep.my_sin.sin_addr),
-          ntohs(ep.my_sin.sin_port));
 
     // Post receives
     post_receives(ep);
@@ -1232,6 +1218,29 @@ static void client_wait_for_recv(endpoint_t &ep, msg_type_t type,
 
 static void client_hulk_smash(endpoint_t &ep)
 {
+    // JMS This seems to be problematic, but we're also running into
+    // other problems.  So temporarily disable the
+    // tear-everything-down-and-rebuild-from-scratch stuff.
+    return;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     logme("Hulk smash!\n");
 
     // Tear it all down
@@ -1378,9 +1387,6 @@ static void client_main()
     endpoint_t ep;
     setup_ofi_endpoint(ep);
     setup_ofi_rdma_slab(ep);
-
-    logme("My endpoint is %s:%d\n",
-          inet_ntoa(ep.my_sin.sin_addr), ntohs(ep.my_sin.sin_port));
 
     // Post receives
     post_receives(ep);
