@@ -182,7 +182,7 @@ static void modex(struct sockaddr_in &sin)
 // OFI-related data structures
 //
 
-// Cached mapping of MPI_COMM_WORLD rank to fi_addr_t
+// Cached mapping of MPI_COMM_WORLD rank to fi_addr_t (for clients)
 typedef map<int, fi_addr_t> rank_to_fi_addr_map_t;
 
 // Type of context on a CQ entry
@@ -214,8 +214,8 @@ struct device_t {
 };
 
 // JMS: I don't know why, but this causes a segv if
-// rank_to_fi_addr_map is inside struct device_t. :-(
-static rank_to_fi_addr_map_t rank_to_fi_addr_map;
+// client_rank_to_fi_addr_map is inside struct device_t. :-(
+static rank_to_fi_addr_map_t client_rank_to_fi_addr_map;
 
 // OFI attributes for a specific RDM endpoint
 struct endpoint_t {
@@ -711,47 +711,6 @@ static void wait_for_cq(struct fid_cq *cq, struct fi_cq_msg_entry &cqe_out)
     }
 }
 
-//
-// If we have an entry in the fi_addr_t cache for a given MCW rank,
-// then we're "connected" (meaning: we have some state about this
-// peer).
-//
-static bool rank_connected(int rank)
-{
-    rank_to_fi_addr_map_t::iterator it;
-    it = rank_to_fi_addr_map.find(rank);
-    return (rank_to_fi_addr_map.end() == it) ? false : true;
-}
-
-//
-// Look up a cached fi_addr_t based on an MPI_COMM_WORLD rank.  If we
-// don't have it, fi_av_insert() it, and then save the result in the
-// cache map for next time.
-//
-static fi_addr_t rank_to_fi_addr(int rank)
-{
-    if (rank_connected(rank)) {
-        return rank_to_fi_addr_map[rank];
-    }
-
-    struct sockaddr_in addr_sin;
-    memset(&addr_sin, 0, sizeof(addr_sin));
-    addr_sin.sin_family = AF_INET;
-    addr_sin.sin_addr.s_addr = modex_data[rank].ip_addr.ip_addr;
-    addr_sin.sin_port = modex_data[rank].ip_addr.ip_port_be;
-
-    int ret;
-    fi_addr_t addr_fi;
-    ret = fi_av_insert(fidev.av, &addr_sin, 1, &addr_fi, 0, NULL);
-    assert(1 == ret);
-    logme("fi_av_insert of %s:%d --> fi_addr_t 0x%" PRIx64 "\n",
-          inet_ntoa(addr_sin.sin_addr), htons(addr_sin.sin_port), addr_fi);
-
-    rank_to_fi_addr_map[rank] = addr_fi;
-
-    return addr_fi;
-}
-
 ////////////////////////////////////////////////////////////////////////
 
 static void post_receive(endpoint_t &ep, uint8_t *receive_buffer, void *context)
@@ -849,6 +808,7 @@ static void msg_verify(endpoint_t &ep, msg_t *msg)
 
 ////////////////////////////////////////////////////////////////////////
 
+// For servers only
 struct client_info_t {
     struct sockaddr_in   addr_sin; // just for our reference
     int                  mcw_rank; // just for our reference
@@ -860,7 +820,7 @@ struct client_info_t {
 
 typedef map<struct sockaddr_in, client_info_t> client_map_t;
 
-static client_map_t client_map;
+static client_map_t server_map_of_clients;
 
 // Provide operator<() for sockaddr_in so that we can use it as the
 // key in an stl::map.
@@ -937,8 +897,8 @@ static void server_handle_connect(struct endpoint_t &ep, msg_t *msg)
     addr_sin.sin_port = msg->from_ip.ip_port_be;
 
     client_map_t::iterator it;
-    it = client_map.find(addr_sin);
-    if (client_map.end() != it) {
+    it = server_map_of_clients.find(addr_sin);
+    if (server_map_of_clients.end() != it) {
         error("...but we're already connected\n");
     }
 
@@ -957,7 +917,7 @@ static void server_handle_connect(struct endpoint_t &ep, msg_t *msg)
     cinfo.addr_ip = msg->from_ip;
     cinfo.rdma_key = msg->u.connect.client_rdma_key;
     cinfo.mcw_rank = msg->from_mcw_rank;
-    client_map[addr_sin] = cinfo;
+    server_map_of_clients[addr_sin] = cinfo;
 
     // Send back a CONNECT_ACK
     // Fill header of message
@@ -995,8 +955,8 @@ static void server_handle_disconnect(struct endpoint_t &ep, msg_t *msg)
     addr_sin.sin_port = msg->from_ip.ip_port_be;
 
     client_map_t::iterator it;
-    it = client_map.find(addr_sin);
-    if (client_map.end() == it) {
+    it = server_map_of_clients.find(addr_sin);
+    if (server_map_of_clients.end() == it) {
         error("...but we don't know who this client is!\n");
     }
 
@@ -1009,8 +969,8 @@ static void server_handle_disconnect(struct endpoint_t &ep, msg_t *msg)
           htons(it->second.addr_sin.sin_port),
           it->second.addr_fi);
 
-    // Remove this client from the client_map
-    client_map.erase(it);
+    // Remove this client from the server_map_of_clients
+    server_map_of_clients.erase(it);
 }
 
 static void server_handle_solicit_rdma(struct endpoint_t &ep, msg_t *msg)
@@ -1025,8 +985,8 @@ static void server_handle_solicit_rdma(struct endpoint_t &ep, msg_t *msg)
     addr_sin.sin_port = msg->from_ip.ip_port_be;
 
     client_map_t::iterator it;
-    it = client_map.find(addr_sin);
-    if (client_map.end() == it) {
+    it = server_map_of_clients.find(addr_sin);
+    if (server_map_of_clients.end() == it) {
         error("...but we don't know who this client is!\n");
     }
 
@@ -1170,6 +1130,56 @@ static void server_main()
 
 ////////////////////////////////////////////////////////////////////////
 
+//
+// If we have an entry in the fi_addr_t cache for a given MCW rank,
+// then we're "connected" (meaning: we have some state about this
+// peer).
+//
+static bool client_rank_connected(int rank)
+{
+    rank_to_fi_addr_map_t::iterator it;
+    it = client_rank_to_fi_addr_map.find(rank);
+    return (client_rank_to_fi_addr_map.end() == it) ? false : true;
+}
+
+static void client_rank_disconnect(int rank)
+{
+    rank_to_fi_addr_map_t::iterator it;
+    it = client_rank_to_fi_addr_map.find(rank);
+    if (client_rank_to_fi_addr_map.end() != it) {
+        client_rank_to_fi_addr_map.erase(it);
+    }
+}
+
+//
+// Look up a cached fi_addr_t based on an MPI_COMM_WORLD rank.  If we
+// don't have it, fi_av_insert() it, and then save the result in the
+// cache map for next time.
+//
+static fi_addr_t client_rank_to_fi_addr(int rank)
+{
+    if (client_rank_connected(rank)) {
+        return client_rank_to_fi_addr_map[rank];
+    }
+
+    struct sockaddr_in addr_sin;
+    memset(&addr_sin, 0, sizeof(addr_sin));
+    addr_sin.sin_family = AF_INET;
+    addr_sin.sin_addr.s_addr = modex_data[rank].ip_addr.ip_addr;
+    addr_sin.sin_port = modex_data[rank].ip_addr.ip_port_be;
+
+    int ret;
+    fi_addr_t addr_fi;
+    ret = fi_av_insert(fidev.av, &addr_sin, 1, &addr_fi, 0, NULL);
+    assert(1 == ret);
+    logme("fi_av_insert of %s:%d --> fi_addr_t 0x%" PRIx64 "\n",
+          inet_ntoa(addr_sin.sin_addr), htons(addr_sin.sin_port), addr_fi);
+
+    client_rank_to_fi_addr_map[rank] = addr_fi;
+
+    return addr_fi;
+}
+
 static void client_wait_for_recv(endpoint_t &ep, msg_type_t type,
                                  cqe_context_t *&cqec)
 {
@@ -1269,7 +1279,7 @@ static void client_connect(endpoint_t &ep, int server_mcw_rank)
 
     // Send
     fi_addr_t peer_fi;
-    peer_fi = rank_to_fi_addr(server_mcw_rank);
+    peer_fi = client_rank_to_fi_addr(server_mcw_rank);
     msg_send(ep, to_server, peer_fi);
 
     // Wait for CONNECT_ACK message and completion of the send
@@ -1288,7 +1298,7 @@ static void client_connect(endpoint_t &ep, int server_mcw_rank)
 static void client_solicit_rdma(endpoint_t &ep, int server_mcw_rank)
 {
     // If we're not already connected, connect
-    if (!rank_connected(server_mcw_rank)) {
+    if (!client_rank_connected(server_mcw_rank)) {
         client_connect(ep, server_mcw_rank);
     }
 
@@ -1320,7 +1330,7 @@ static void client_solicit_rdma(endpoint_t &ep, int server_mcw_rank)
 
     // Send it
     fi_addr_t peer_fi;
-    peer_fi = rank_to_fi_addr(server_mcw_rank);
+    peer_fi = client_rank_to_fi_addr(server_mcw_rank);
     msg_send(ep, to_server, peer_fi);
 
     // Wait for a message back from the server saying that the RDMA to
@@ -1349,7 +1359,7 @@ static void client_solicit_rdma(endpoint_t &ep, int server_mcw_rank)
 static void client_disconnect(endpoint_t &ep, int server_mcw_rank)
 {
     // If we're not connected, just return
-    if (!rank_connected(server_mcw_rank)) {
+    if (!client_rank_connected(server_mcw_rank)) {
         return;
     }
 
@@ -1365,8 +1375,11 @@ static void client_disconnect(endpoint_t &ep, int server_mcw_rank)
 
     // Send and wait for the message
     fi_addr_t peer_fi;
-    peer_fi = rank_to_fi_addr(server_mcw_rank);
+    peer_fi = client_rank_to_fi_addr(server_mcw_rank);
     msg_send(ep, to_server, peer_fi);
+
+    // Actually disconnect us
+    client_rank_disconnect(server_mcw_rank);
 }
 
 //
