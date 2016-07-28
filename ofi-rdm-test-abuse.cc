@@ -495,6 +495,8 @@ static void setup_ofi_device(void)
     sin->sin_port = 0;
 
     // Make a fabric from first info returned
+    // Ensure we're in "basic" MR mode!
+    fidev.info->domain_attr->mr_mode = FI_MR_BASIC;
     ret = fi_fabric(fidev.info->fabric_attr, &fidev.fabric, NULL);
     if (0 != ret) {
         error("fi_fabric failed");
@@ -616,6 +618,7 @@ static void setup_ofi_rdma_slab(endpoint_t &ep)
     memset(ep.rdma_slab, 0, RDMA_SLAB_SIZE);
 
     int ret;
+    memset(&(ep.rdma_slab_mr), 0, sizeof(ep.rdma_slab_mr));
     ret = fi_mr_reg(fidev.domain, ep.rdma_slab, RDMA_SLAB_SIZE,
                     mr_flags, 0, (uintptr_t) ep.rdma_slab,
                     0, &(ep.rdma_slab_mr), NULL);
@@ -624,7 +627,9 @@ static void setup_ofi_rdma_slab(endpoint_t &ep)
         error("fi_mr_reg(rdma) failed");
     }
 
-    logme("My RDMA slab: %p - %p\n", ep.rdma_slab, (ep.rdma_slab + RDMA_SLAB_SIZE));
+    logme("My RDMA slab: %p - %p (len %" PRIu64 ")\n",
+          ep.rdma_slab, (ep.rdma_slab + RDMA_SLAB_SIZE),
+          RDMA_SLAB_SIZE);
 }
 
 static void teardown_ofi_rdma_slab(endpoint_t &ep)
@@ -686,6 +691,7 @@ static void wait_for_cq(struct fid_cq *cq, struct fi_cq_msg_entry &cqe_out)
                 assert(cqec);
                 assert(CQEC_WRITE == cqec->type);
                 logme("===== error on RDMA WRITE, seq=%" PRIu64 "\n", cqec->seq);
+                error("===== cannot continue\n");
                 continue;
             }
         } else if (ret != 1) {
@@ -1024,15 +1030,20 @@ static void server_handle_solicit_rdma(struct endpoint_t &ep, msg_t *msg)
     }
 
     // Do the RDMA write
-    logme("RDMA writing to %s:%d (fi_addr 0x%" PRIx64 ", MCW rank %d), dest buffer=%p - %p, seq=%" PRIu64 ", dest key=%" PRIx64 "\n",
+    logme("RDMA writing to %s:%d (fi_addr 0x%" PRIx64 ", MCW rank %d), dest buffer=%p - %p (len=%" PRIu64 "), seq=%" PRIu64 ", dest key=%" PRIx64 "\n",
           inet_ntoa(it->second.addr_sin.sin_addr),
           ntohs(it->second.addr_sin.sin_port),
           it->second.addr_fi,
           it->second.mcw_rank,
           msg->u.solicit_rdma.client_rdma_target_addr,
           msg->u.solicit_rdma.client_rdma_target_addr + len,
+          len,
           cqec->seq,
           it->second.rdma_key);
+    ssize_t fi_write(struct fid_ep *ep, const void *buf, size_t len,
+                     void *desc, fi_addr_t dest_addr, uint64_t addr, uint64_t key,
+                     void *context);
+
     ret = fi_write(ep.ep, rdma_buffer, len, fi_mr_desc(cqec->mr),
                    it->second.addr_fi,
                    msg->u.solicit_rdma.client_rdma_target_addr,
@@ -1276,6 +1287,8 @@ static void client_connect(endpoint_t &ep, int server_mcw_rank)
 
     // Fill payload of message
     to_server->u.connect.client_rdma_key = fi_mr_key(ep.rdma_slab_mr);
+    logme("MSG_CONNECT sending my slab RDMA key: %" PRIx64 "\n",
+          fi_mr_key(ep.rdma_slab_mr));
 
     // Send
     fi_addr_t peer_fi;
