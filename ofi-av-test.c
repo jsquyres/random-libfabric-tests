@@ -125,8 +125,9 @@ static void test_av()
         ret = fi_av_insert(fidev.av, &addr_sin, 1, &addr_fi, 0, NULL);
         if (ret != 1)  {
             fprintf(stderr, "Failed to fi_av_insert address %d: ret=%d\n", i, ret);
+        } else {
+            printf("Added address %d: 0x%" PRIx64 "\n", i, addr_fi);
         }
-        printf("Added address %d: 0x%" PRIx64 "\n", i, addr_fi);
 
         ret = fi_av_remove(fidev.av, &addr_fi, 1, 0);
         assert(ret == 0);
