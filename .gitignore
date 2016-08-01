@@ -1,5 +1,6 @@
 *.o
 
+ofi-av-test
 ofi-msg-fd-sockets-test
 ofi-rdm-test-abuse
 ofi-rdm-test

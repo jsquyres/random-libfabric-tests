@@ -12,6 +12,7 @@ LDFLAGS = -L$(LIBFABRIC_DIR)/lib
 LIBS = -lfabric
 
 PROGRAMS = \
+        ofi-av-test \
         ofi-msg-fd-sockets-test \
         ofi-rdm-test \
         ofi-rdm-test-disconnect \
@@ -19,6 +20,8 @@ PROGRAMS = \
 
 all: $(PROGRAMS)
 
+ofi-av-test: ofi-av-test.o
+	$(CC) $(CFLAGS) $< $(LDFAGS) $(LIBS) -o $@
 ofi-msg-fd-sockets-test: ofi-msg-fd-sockets-test.o
 	$(CC) $(CFLAGS) $< $(LDFAGS) $(LIBS) -o $@
 ofi-rdm-test: ofi-rdm-test.o
