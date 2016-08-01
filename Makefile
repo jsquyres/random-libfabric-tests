@@ -3,7 +3,7 @@ CXX = mpiCC
 
 LIBFABRIC_DIR = $(bogus)
 
-CPPFLAGS = -I$(LIBFABRIC_DIR)/include
+CPPFLAGS = -I$(LIBFABRIC_DIR)/include -I.
 CFLAGS = -g -O0 -Wall
 CXXPPFLAGS = $(CPPFLAGS)
 CXXFLAGS = $(CFLAGS) -std=gnu++11
@@ -13,7 +13,6 @@ LIBS = -lfabric
 
 PROGRAMS = \
         ofi-msg-fd-sockets-test \
-        ofi-rdm-test-abuse \
         ofi-rdm-test \
         ofi-rdm-test-disconnect \
         ofi-test
@@ -22,8 +21,6 @@ all: $(PROGRAMS)
 
 ofi-msg-fd-sockets-test: ofi-msg-fd-sockets-test.o
 	$(CC) $(CFLAGS) $< $(LDFAGS) $(LIBS) -o $@
-ofi-rdm-test-abuse: ofi-rdm-test-abuse.o
-	$(CXX) $(CXXFLAGS) $< $(LDFAGS) $(LIBS) -o $@
 ofi-rdm-test: ofi-rdm-test.o
 	$(CC) $(CFLAGS) $< $(LDFAGS) $(LIBS) -o $@
 ofi-rdm-test-disconnect: ofi-rdm-test-disconnect.o
