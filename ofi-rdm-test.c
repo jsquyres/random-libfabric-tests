@@ -63,7 +63,7 @@ static void do_error(const char *msg, int line)
     exit(1);
 }
 
-static void wait_for_debugger(void)
+void wait_for_debugger(void)
 {
     printf("%s:%s:MCW %d:PID %d: waiting for debugger attach...\n",
            id, hostname, comm_rank, getpid());
@@ -100,7 +100,7 @@ const char *sprintf_cqe_flags(uint64_t flags)
 {
     static char str[8192];
 
-    snprintf(str, sizeof(str), "0x%x: ", flags);
+    snprintf(str, sizeof(str), "0x%" PRIx64 ": ", flags);
     if (flags & FI_SEND) strncat(str, "FI_SEND ", sizeof(str));
     if (flags & FI_RECV) strncat(str, "FI_RECV ", sizeof(str));
     if (flags & FI_RMA) strncat(str, "FI_RMA ", sizeof(str));
@@ -167,7 +167,6 @@ static fi_device_t fidev;
 static fi_conn_t ficonn;
 static int epoll_fd = -1;
 static struct sockaddr_in sin;
-static int listen_port = 5050;
 #define NUM_XDATA 4
 static uint32_t *server_data = NULL;
 static uint8_t *rdma_slab = NULL;

@@ -1,4 +1,4 @@
-#define WANT_FDS 0
+#define WANT_FDS 1
 #define WANT_FIXED_PORT 1
 
 #include <stdio.h>
@@ -39,7 +39,7 @@ static void do_error(const char *msg, int line)
     exit(1);
 }
 
-static void wait_for_debugger(void)
+void wait_for_debugger(void)
 {
     printf("%s:%s:MCW %d:PID %d: waiting for debugger attach...\n",
            id, hostname, comm_rank, getpid());

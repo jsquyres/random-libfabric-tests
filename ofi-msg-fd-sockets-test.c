@@ -48,7 +48,7 @@ static void do_error(const char *msg, int line)
     exit(1);
 }
 
-static void wait_for_debugger(void)
+void wait_for_debugger(void)
 {
     printf("%s:MCW %d:PID %d: waiting for debugger attach...\n",
            id, comm_rank, getpid());
@@ -122,7 +122,6 @@ typedef struct {
 static fistuff_t fistuff;
 static int epoll_fd = -1;
 static struct sockaddr_in sin;
-static int listen_port = 5050;
 #define NUM_CONN_DATA 4
 static uint32_t server_data[NUM_CONN_DATA] = { 19, 20, 21, 22 };
 static uint32_t client_data[NUM_CONN_DATA] = { 29, 30, 31, 32 };
