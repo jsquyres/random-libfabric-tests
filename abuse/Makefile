@@ -20,7 +20,7 @@ client.cc: abuse.h
 server.cc: abuse.h
 
 abuse: main.o client.o server.o
-	$(CXX) $(CXXFLAGS) $^ $(LDFAGS) $(LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) $(LIBS) -o $@
 
 clean:
 	rm -f *.o $(PROGRAMS) *~
