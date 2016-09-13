@@ -290,7 +290,7 @@ static void client_disconnect(endpoint_t &ep, int server_mcw_rank)
 
     // There is no payload for the DISCONNECT message
 
-    // Send and wait for the message
+    // Send the disconnect message; no need to wait for it to complete
     fi_addr_t peer_fi;
     peer_fi = client_rank_to_fi_addr(server_mcw_rank);
     msg_send(ep, to_server, peer_fi);
