@@ -407,6 +407,9 @@ void setup_ofi_device(void)
     // Make a fabric from first info returned
     // Ensure we're in "basic" MR mode!
     fidev.info->domain_attr->mr_mode = FI_MR_BASIC;
+    // Make sure we specify we want message ordering
+    fidev.info->tx_attr->comp_order |= FI_ORDER_SAS;
+    fidev.info->rx_attr->comp_order |= FI_ORDER_SAS;
     ret = fi_fabric(fidev.info->fabric_attr, &fidev.fabric, NULL);
     if (0 != ret) {
         error("fi_fabric failed");
