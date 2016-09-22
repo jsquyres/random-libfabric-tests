@@ -12,6 +12,7 @@
 
 #include <cstdlib>
 #include <cinttypes>
+#include <list>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -26,6 +27,12 @@
 
 // Mapping of [0, num_servers) to their MCW ranks
 static int *server_mcw_ranks = NULL;
+
+// Completed sends
+static std::list<cqe_context_t*> completed_sends;
+
+// Completed receives
+static std::list<cqe_context_t*> completed_recvs;
 
 
 //
@@ -88,12 +95,12 @@ static fi_addr_t client_rank_to_fi_addr(int rank)
     return addr_fi;
 }
 
-static void client_wait_for_recv(endpoint_t &ep, msg_type_t type,
-                                 cqe_context_t *&cqec)
+static void client_wait_for_cq(endpoint_t &ep)
 {
-    logme("Waiting to receive message of type %d\n", type);
+    logme("Waiting for CQ entry\n");
 
     // Wait for something on the CQ
+    cqe_context_t *cqec;
     struct fi_cq_msg_entry cqe;
     while (1) {
         wait_for_cq(ep.cq, cqe);
@@ -104,18 +111,18 @@ static void client_wait_for_recv(endpoint_t &ep, msg_type_t type,
         // If we completed a send, free the buffer and cqec
         if (cqe.flags & FI_SEND) {
             logme("CQ: Completed a send\n");
-            delete cqec->buffer;
-            delete cqec;
-            continue;
+            completed_sends.push_front(cqec);
+            return;
         }
 
         // If we completed an RDMA (should never happen here in the client)
         if ((cqe.flags & FI_RECV) && (cqe.flags & FI_RMA)) {
-            logme("CQ: Completed an RDMA\n");
+            logme("CQ: Completed an RDMA -- this should not happen\n");
             continue;
         }
 
-        // Make sure it was a receive
+        // If it wasn't any of the above, then make sure it was a
+        // receive
         assert(cqe.flags & FI_RECV);
         assert(cqe.flags & FI_MSG);
         logme("CQ: Completed a receive\n");
@@ -123,14 +130,49 @@ static void client_wait_for_recv(endpoint_t &ep, msg_type_t type,
         assert(cqec->type == CQEC_RECV);
         assert(cqec->seq == 0);
 
-        // Make sure the received message was the right type
-        msg_t *msg;
-        msg = (msg_t*) cqec->buffer;
-        msg_verify(ep, msg);
-        assert(msg->type == type);
+        completed_recvs.push_front(cqec);
 
         // All good!
         return;
+    }
+}
+
+static void client_wait_for_recv(endpoint_t &ep, msg_type_t type,
+                                 cqe_context_t *&cqec)
+{
+    // Wait until something shows up in the completed_recvs list.
+    while (completed_recvs.empty()) {
+        client_wait_for_cq(ep);
+    }
+
+    // Make sure the received message was the right type
+    cqec = completed_recvs.back();
+    completed_recvs.pop_back();
+
+    msg_t *msg;
+    msg = (msg_t*) cqec->buffer;
+    msg_verify(ep, msg);
+    assert(msg->type == type);
+}
+
+static void client_wait_for_send(endpoint_t &ep, cqe_context_t *interesting)
+{
+    cqe_context_t *cqec;
+    while (1) {
+        // Wait until something shows up in the completed_sends list.
+        while (completed_sends.empty()) {
+            client_wait_for_cq(ep);
+        }
+
+        // Handle the completed send (i.e., release the memory)
+        cqec = completed_sends.back();
+        completed_sends.pop_back();
+        delete cqec->buffer;
+        delete cqec;
+
+        if (cqec == interesting) {
+            return;
+        }
     }
 }
 
@@ -290,10 +332,16 @@ static void client_disconnect(endpoint_t &ep, int server_mcw_rank)
 
     // There is no payload for the DISCONNECT message
 
-    // Send the disconnect message; no need to wait for it to complete
+    // Send the disconnect message
     fi_addr_t peer_fi;
     peer_fi = client_rank_to_fi_addr(server_mcw_rank);
-    msg_send(ep, to_server, peer_fi);
+    cqe_context_t *cqec;
+    cqec = msg_send(ep, to_server, peer_fi);
+
+    // Wait for that send to complete (we can't remove the address
+    // from the AV until all pending operations with this peer are
+    // complete).
+    client_wait_for_send(ep, cqec);
 
     // Mark us as "disconnected"
     client_rank_disconnect(server_mcw_rank);

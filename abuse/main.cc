@@ -685,7 +685,7 @@ void msg_fill_header(endpoint_t &ep, msg_t *msg, msg_type_t type)
           ntohs(msg->from_ip.ip_port_be));
 }
 
-uint64_t msg_send(endpoint_t &ep, msg_t *msg, fi_addr_t peer_fi)
+cqe_context_t *msg_send(endpoint_t &ep, msg_t *msg, fi_addr_t peer_fi)
 {
     // Make a CQ context entry
     cqe_context_t *cqec = new cqe_context_t;
@@ -700,7 +700,7 @@ uint64_t msg_send(endpoint_t &ep, msg_t *msg, fi_addr_t peer_fi)
     logme("Sending to fi_addr 0x%" PRIx64 "\n", peer_fi);
     fi_send(ep.ep, msg, sizeof(*msg), fi_mr_desc(&no_mr), peer_fi, cqec);
 
-    return my_seq;
+    return cqec;
 }
 
 void msg_verify(endpoint_t &ep, msg_t *msg)

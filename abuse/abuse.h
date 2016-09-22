@@ -198,7 +198,7 @@ void post_receive(endpoint_t &ep, uint8_t *receive_buffer, void *context);
 void post_receives(endpoint_t &ep);
 
 void msg_fill_header(endpoint_t &ep, msg_t *msg, msg_type_t type);
-uint64_t msg_send(endpoint_t &ep, msg_t *msg, fi_addr_t peer_fi);
+cqe_context_t *msg_send(endpoint_t &ep, msg_t *msg, fi_addr_t peer_fi);
 void msg_verify(endpoint_t &ep, msg_t *msg);
 
 #endif // OFI_RDM_TEST_ABUSE_H
