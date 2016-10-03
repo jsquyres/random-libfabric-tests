@@ -167,7 +167,7 @@ static void client_wait_for_send(endpoint_t &ep, cqe_context_t *interesting)
         // Handle the completed send (i.e., release the memory)
         cqec = completed_sends.back();
         completed_sends.pop_back();
-        delete cqec->buffer;
+        delete (msg_t*) cqec->buffer;
         delete cqec;
 
         if (cqec == interesting) {

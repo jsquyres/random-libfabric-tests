@@ -98,7 +98,7 @@ static void server_handle_send_completion(struct fi_cq_msg_entry &cqe)
     assert(cqec->buffer);
 
     // Delete the send buffer and the CQEC
-    delete cqec->buffer;
+    delete (msg_t*) cqec->buffer;
     delete cqec;
 }
 
