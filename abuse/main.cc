@@ -146,9 +146,8 @@ static void setup_mpi(void)
             if (i == comm_rank) {
                 i_am_server = true;
                 logme("I AM A SERVER!\n");
-            } else {
-                break;
             }
+            break;
         }
     }
 
