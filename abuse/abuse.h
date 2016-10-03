@@ -21,7 +21,7 @@ extern int num_servers;
 extern uint32_t my_epoll_type;
 extern const char *id;
 extern bool hostname_set;
-extern char hostname[4096];
+extern char *hostname;
 
 
 //

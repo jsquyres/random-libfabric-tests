@@ -38,7 +38,7 @@ int num_servers = 0;
 uint32_t my_epoll_type = 0;
 const char *id = "UNKNOWN";
 bool hostname_set = false;
-char hostname[4096];
+char *hostname = NULL;
 
 ////////////////////////////////////////////////////////////////////////
 //
@@ -119,7 +119,9 @@ static void setup_mpi(void)
     MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
-    int s = sizeof(hostname);
+    int s = MPI_MAX_PROCESSOR_NAME;
+    hostname = new char[s];
+    assert(hostname);
     MPI_Get_processor_name(hostname, &s);
     hostname_set = true;
 
@@ -127,16 +129,31 @@ static void setup_mpi(void)
         error("Must run at least 2 MPI processes\n");
     }
 
-#if defined(OPEN_MPI) && OPEN_MPI
-    const char *e = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
-    assert(e);
-    if (atoi(e) == 0) {
-        i_am_server = true;
-        logme("I AM A SERVER!\n");
+    // Get the "first" MPI process on each host.  Do this by
+    // allgathering the hostnames.
+    char **names = new char*[comm_size];
+    names[0] = new char[comm_size * MPI_MAX_PROCESSOR_NAME];
+    for (int i = 1; i < comm_size; ++i) {
+        names[i] = names[i - 1] + MPI_MAX_PROCESSOR_NAME;
     }
-#else
-#error Need a way to determine the "first" MPI process on each server
-#endif
+
+    MPI_Allgather(hostname, MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+                  &names[0][0], MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+                  MPI_COMM_WORLD);
+
+    for (int i = 0; i < comm_size; ++i) {
+        if (strcmp(names[i], hostname) == 0) {
+            if (i == comm_rank) {
+                i_am_server = true;
+                logme("I AM A SERVER!\n");
+            } else {
+                break;
+            }
+        }
+    }
+
+    delete[] names[0];
+    delete[] names;
 
     // Make things (sorta) repeatable
     srand(comm_rank);
@@ -146,6 +163,10 @@ static void setup_mpi(void)
 static void teardown_mpi(void)
 {
     MPI_Finalize();
+
+    delete[] hostname;
+    hostname = NULL;
+    hostname_set = false;
 }
 
 void modex(struct sockaddr_in &sin)
