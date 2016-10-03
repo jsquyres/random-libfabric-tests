@@ -391,6 +391,8 @@ void client_main()
     // Post receives
     post_receives(ep);
 
+    logme("Entering main client loop\n");
+
     // Main client loop
     double chaos;
     int server_mcw_rank;
