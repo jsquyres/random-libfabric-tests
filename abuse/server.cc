@@ -325,7 +325,7 @@ void server_main()
     // Broadcast my OFI endpoint IP address+port to all clients
     modex(ep.my_sin);
 
-    uint64_t rma_completion = FI_RMA | FI_MSG | FI_SEND;
+    uint64_t rma_completion = FI_RMA | FI_WRITE;
     uint64_t send_completion = FI_SEND | FI_MSG;
     uint64_t recv_completion = FI_RECV | FI_MSG;
 
