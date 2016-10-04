@@ -19,6 +19,10 @@ main.cc: abuse.h
 client.cc: abuse.h
 server.cc: abuse.h
 
+main.o: main.cc
+client.o: client.cc
+server.o: server.cc
+
 abuse: main.o client.o server.o
 	$(CXX) $(CXXFLAGS) $^ $(LDFLAGS) $(LIBS) -o $@
 
