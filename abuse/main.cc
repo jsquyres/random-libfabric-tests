@@ -40,6 +40,11 @@ const char *id = "UNKNOWN";
 bool hostname_set = false;
 char *hostname = NULL;
 
+// -1 = run forever.
+// Positive integer = run that many RDMA interactions with each
+// client/server pair and then teardown / quit.
+int num_interactions = -1;
+
 ////////////////////////////////////////////////////////////////////////
 //
 // Logging functions
@@ -132,7 +137,9 @@ static void setup_mpi(void)
     // Get the "first" MPI process on each host.  Do this by
     // allgathering the hostnames.
     char **names = new char*[comm_size];
+    assert(names);
     names[0] = new char[comm_size * MPI_MAX_PROCESSOR_NAME];
+    assert(names[0]);
     for (int i = 1; i < comm_size; ++i) {
         names[i] = names[i - 1] + MPI_MAX_PROCESSOR_NAME;
     }
@@ -753,11 +760,15 @@ int main(int argc, char* argv[])
         id = "SERVER";
         my_epoll_type = 3333;
         server_main();
+        logme("**** Back from server main\n");
     } else {
         id = "CLIENT";
         my_epoll_type = 4444;
         client_main();
+        logme("**** Back from client main\n");
     }
+    MPI_Barrier(MPI_COMM_WORLD);
+    logme("**** Done with final barrier\n");
     teardown_mpi();
 
     return 0;

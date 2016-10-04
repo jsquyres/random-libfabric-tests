@@ -38,6 +38,8 @@ typedef map<struct sockaddr_in, client_info_t> client_map_t;
 // Mapping of client sockaddr_in addresses to meta data about the client
 static client_map_t server_map_of_clients;
 
+// How many times we have interacted with a given MCW rank
+static int *rank_interactions = NULL;
 
 // Provide operator<() for sockaddr_in so that we can use it as the
 // key in an stl::map.
@@ -61,7 +63,6 @@ static bool operator<(const sockaddr_in a, const sockaddr_in b)
 static void server_handle_rdma_completion(struct fi_cq_msg_entry &cqe)
 {
     // We completed an RDMA write.  Yay!
-    logme("Completed an RDMA write\n");
 
     // Get the CQEC
     assert(cqe.op_context);
@@ -73,6 +74,11 @@ static void server_handle_rdma_completion(struct fi_cq_msg_entry &cqe)
     assert(CQEC_WRITE == cqec->type);
     assert(cqec->buffer);
     assert(cqec->mr);
+
+    logme("Completed an RDMA write to MCW rank %d (flags: 0x%x)\n", cqec->peer_mcw_rank, cqe.flags);
+
+    ++rank_interactions[cqec->peer_mcw_rank];
+    logme("AWD server: client interaction[%d] is now %d\n", cqec->peer_mcw_rank, rank_interactions[cqec->peer_mcw_rank]);
 
     // De-register the RDMA memory
     fi_close(&(cqec->mr->fid));
@@ -230,6 +236,7 @@ static void server_handle_solicit_rdma(struct endpoint_t &ep, msg_t *msg)
     cqec->type = CQEC_WRITE;
     cqec->seq = cqe_seq++;
     cqec->buffer = rdma_buffer;
+    cqec->peer_mcw_rank = it->second.mcw_rank;
 
     int ret;
     ret = fi_mr_reg(fidev.domain, rdma_buffer, len,
@@ -310,6 +317,33 @@ static void server_handle_receive(struct endpoint_t &ep, struct fi_cq_msg_entry 
     post_receive(ep, cqec->buffer, (void*) cqec);
 }
 
+static void are_we_done(bool &done)
+{
+    if (-1 == num_interactions) {
+        // Run forever
+        done = false;
+        return;
+    }
+
+    // Check to see if we have had num_interactions with each client.
+    // If so, we're done.
+    int num_clients = 0;
+    int clients_done = 0;
+    for (int i = 0; i < comm_size; ++i) {
+        if (!modex_data[i].is_server) {
+            ++num_clients;
+            if (rank_interactions[i] >= num_interactions) {
+                ++clients_done;
+            }
+        }
+    }
+
+    logme("AWD Server: clients done %d, num clients: %d\n", clients_done, num_clients);
+    if (clients_done >= num_clients) {
+        done = true;
+    }
+}
+
 //
 // Main Server function
 //
@@ -329,9 +363,16 @@ void server_main()
     uint64_t send_completion = FI_SEND | FI_MSG;
     uint64_t recv_completion = FI_RECV | FI_MSG;
 
+    rank_interactions = new int[comm_size];
+    assert(rank_interactions);
+    for (int i = 0; i < comm_size; ++i) {
+        rank_interactions[i] = 0;
+    }
+
     // Main server loop
+    bool done = false;
     struct fi_cq_msg_entry cqe;
-    while (1) {
+    while (!done) {
         wait_for_cq(ep.cq, cqe);
         if (rma_completion == (cqe.flags & rma_completion)) {
             server_handle_rdma_completion(cqe);
@@ -341,7 +382,11 @@ void server_main()
             // We completed a recive.  Yay!
             server_handle_receive(ep, cqe);
         }
+
+        are_we_done(done);
     }
+
+    logme("We are done!\n");
 
     teardown_ofi_endpoint(ep);
     teardown_ofi_device();

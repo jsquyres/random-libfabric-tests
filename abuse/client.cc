@@ -34,6 +34,8 @@ static std::list<cqe_context_t*> completed_sends;
 // Completed receives
 static std::list<cqe_context_t*> completed_recvs;
 
+// How many times we have interacted with a given MCW rank
+static int *rank_interactions = NULL;
 
 //
 // If we have an entry in the fi_addr_t cache for a given MCW rank,
@@ -309,6 +311,10 @@ static void client_solicit_rdma(endpoint_t &ep, int server_mcw_rank)
     // Check that we got what we think we should have gotten
     buffer_pattern_check(ptr, from_server->u.rdma_sent.client_rdma_actual_len);
 
+    // Log the interaction with the server
+    ++rank_interactions[server_mcw_rank];
+    logme("AWD client: server interaction[%d] is now %d\n", server_mcw_rank, rank_interactions[server_mcw_rank]);
+
     // Repost the receive
     post_receive(ep, cqec->buffer, cqec);
 }
@@ -360,6 +366,33 @@ static void client_disconnect(endpoint_t &ep, int server_mcw_rank)
           inet_ntoa(addr_sin.sin_addr), htons(addr_sin.sin_port), peer_fi);
 }
 
+static void are_we_done(bool &done)
+{
+    if (-1 == num_interactions) {
+        // Run forever
+        done = false;
+        return;
+    }
+
+    // Check to see if we have had num_interactions with each server.
+    // If so, we're done.
+    int num_servers = 0;
+    int servers_done = 0;
+    for (int i = 0; i < comm_size; ++i) {
+        if (modex_data[i].is_server) {
+            ++num_servers;
+            if (rank_interactions[i] >= num_interactions) {
+                ++servers_done;
+            }
+        }
+    }
+
+    logme("AWD Client: servers done %d, num servers: %d\n", servers_done, num_servers);
+    if (servers_done >= num_servers) {
+        done = true;
+    }
+}
+
 //
 // Main Client routine
 //
@@ -383,6 +416,12 @@ void client_main()
         }
     }
 
+    rank_interactions = new int[comm_size];
+    assert(rank_interactions);
+    for (int i = 0; i < comm_size; ++i) {
+        rank_interactions[i] = 0;
+    }
+
     // Create my endpoint and RDMA slab
     endpoint_t ep;
     setup_ofi_endpoint(ep);
@@ -394,26 +433,36 @@ void client_main()
     logme("Entering main client loop\n");
 
     // Main client loop
+    bool done = false;
     double chaos;
     int server_mcw_rank;
-    while (1) {
+    while (!done) {
         // Randomly pick a server
         server_mcw_rank = server_mcw_ranks[rand() % num_servers];
 
-        // Randomly pick an action
-        chaos = drand48();
-        if (chaos < 0.05) {
-            client_hulk_smash(ep);
-        } else if (chaos < 0.25) {
-            client_disconnect(ep, server_mcw_rank);
-        } else {
-            client_solicit_rdma(ep, server_mcw_rank);
+        // Only interact with that server if we have not already
+        // interacted with that server enough
+        if (-1 == num_interactions ||
+            rank_interactions[server_mcw_rank] < num_interactions) {
+            // Randomly pick an action
+            chaos = drand48();
+            if (chaos < 0.05) {
+                client_hulk_smash(ep);
+            } else if (chaos < 0.25) {
+                client_disconnect(ep, server_mcw_rank);
+            } else {
+                client_solicit_rdma(ep, server_mcw_rank);
+            }
+
+            // Wait for a (short) random amount of time to simulate
+            // computation
+            usleep(drand48() * 100);
         }
 
-        // Wait for a (short) random amount of time to simulate
-        // computation
-        usleep(drand48() * 100);
+        are_we_done(done);
     }
+
+    logme("We are done!\n");
 
     teardown_ofi_endpoint(ep);
     teardown_ofi_device();

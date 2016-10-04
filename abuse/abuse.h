@@ -22,6 +22,7 @@ extern uint32_t my_epoll_type;
 extern const char *id;
 extern bool hostname_set;
 extern char *hostname;
+extern int num_interactions;
 
 
 //
@@ -78,6 +79,7 @@ enum cqe_context_type_t {
 struct cqe_context_t {
     cqe_context_type_t type;
 
+    int                peer_mcw_rank;
     uint64_t           seq;
     uint8_t           *buffer;
     struct fid_mr     *mr;
