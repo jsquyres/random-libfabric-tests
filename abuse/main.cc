@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cinttypes>
 
+#include <list>
+
 #include <mpi.h>
 
 #include <rdma/fabric.h>
@@ -25,6 +27,8 @@
 #include <rdma/fi_errno.h>
 
 #include "abuse.h"
+
+using namespace std;
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -170,9 +174,16 @@ static void teardown_mpi(void)
 {
     MPI_Finalize();
 
-    delete[] hostname;
-    hostname = NULL;
-    hostname_set = false;
+    if (modex_data != NULL) {
+        delete[] modex_data;
+        modex_data = NULL;
+    }
+
+    if (hostname != NULL) {
+        delete[] hostname;
+        hostname = NULL;
+        hostname_set = false;
+    }
 }
 
 void modex(struct sockaddr_in &sin)
@@ -274,12 +285,14 @@ void log_outbound_msg(endpoint_t &ep, int mcw_rank, const char *label)
 // Epoll utility functions
 //
 
+static list<void*> mem_to_free;
+
 static void add_epoll_fd(int fd)
 {
-    // This is a memory leak; I know.  Good enough for a small test.
     struct epoll_event *edt;
     edt = (struct epoll_event*) calloc(1, sizeof(*edt));
     assert(edt != NULL);
+    mem_to_free.push_back((void*) edt);
 
     edt->events = EPOLLIN;
     edt->data.u32 = my_epoll_type;
@@ -292,10 +305,10 @@ static void add_epoll_fd(int fd)
 
 static void del_epoll_fd(int fd)
 {
-    // This is a memory leak; I know.  Good enough for a small test.
     struct epoll_event *edt;
     edt = (struct epoll_event*) calloc(1, sizeof(edt));
     assert(edt != NULL);
+    mem_to_free.push_back((void*) edt);
 
     edt->events = EPOLLIN;
     edt->data.u32 = my_epoll_type;
@@ -586,6 +599,9 @@ void teardown_ofi_endpoint(endpoint_t &ep)
     if (ep.receive_buffers) {
         delete[] ep.receive_buffers;
     }
+    if (ep.cqe_contexts) {
+        delete[] ep.cqe_contexts;
+    }
 
     del_epoll_fd(ep.cq_fd);
     fi_close(&(ep.cq->fid));
@@ -600,6 +616,11 @@ void teardown_ofi_device(void)
     fi_close(&(fidev.domain->fid));
     fi_close(&(fidev.eq->fid));
     fi_freeinfo(fidev.info);
+
+    list<void*>::iterator it;
+    for (it = mem_to_free.begin(); it != mem_to_free.end(); it++) {
+        free(*it);
+    }
 }
 
 void teardown_ofi(endpoint_t &ep)
