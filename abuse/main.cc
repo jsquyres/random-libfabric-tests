@@ -602,6 +602,13 @@ void teardown_ofi_device(void)
     fi_freeinfo(fidev.info);
 }
 
+void teardown_ofi(endpoint_t &ep)
+{
+    teardown_ofi_rdma_slab(ep);
+    teardown_ofi_endpoint(ep);
+    teardown_ofi_device();
+}
+
 void wait_for_cq(struct fid_cq *cq, struct fi_cq_msg_entry &cqe_out)
 {
     int ret;

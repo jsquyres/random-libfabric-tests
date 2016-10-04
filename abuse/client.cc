@@ -206,9 +206,7 @@ static void client_hulk_smash(endpoint_t &ep)
     logme("Hulk smash!\n");
 
     // Tear it all down
-    teardown_ofi_rdma_slab(ep);
-    teardown_ofi_endpoint(ep);
-    teardown_ofi_device();
+    teardown_ofi(ep);
 
     // Recreate
     setup_ofi_device();
@@ -464,6 +462,5 @@ void client_main()
 
     logme("We are done!\n");
 
-    teardown_ofi_endpoint(ep);
-    teardown_ofi_device();
+    teardown_ofi(ep);
 }

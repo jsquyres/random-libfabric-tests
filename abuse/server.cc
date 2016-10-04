@@ -388,6 +388,5 @@ void server_main()
 
     logme("We are done!\n");
 
-    teardown_ofi_endpoint(ep);
-    teardown_ofi_device();
+    teardown_ofi(ep);
 }

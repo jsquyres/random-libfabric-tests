@@ -190,6 +190,7 @@ void buffer_pattern_check(uint8_t *ptr, uint64_t len);
 void setup_ofi_device(void);
 void setup_ofi_endpoint(endpoint_t &ep);
 void setup_ofi_rdma_slab(endpoint_t &ep);
+void teardown_ofi(endpoint_t &ep);
 void teardown_ofi_rdma_slab(endpoint_t &ep);
 void teardown_ofi_endpoint(endpoint_t &ep);
 void teardown_ofi_device(void);
