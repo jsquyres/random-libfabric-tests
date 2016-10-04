@@ -251,9 +251,6 @@ static void server_handle_solicit_rdma(struct endpoint_t &ep, msg_t *msg)
           len,
           cqec->seq,
           it->second.rdma_key);
-    ssize_t fi_write(struct fid_ep *ep, const void *buf, size_t len,
-                     void *desc, fi_addr_t dest_addr, uint64_t addr, uint64_t key,
-                     void *context);
 
     ret = fi_write(ep.ep, rdma_buffer, len, fi_mr_desc(cqec->mr),
                    it->second.addr_fi,
